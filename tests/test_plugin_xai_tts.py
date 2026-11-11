@@ -13,14 +13,16 @@ import aiohttp
 import pytest
 
 from livekit.agents import APIConnectOptions
+from livekit.agents.types import TimedString
 from livekit.plugins.xai import tts as xai_tts
 
 pytestmark = pytest.mark.plugin("xai")
 
 
 class _FakeWebSocket:
-    def __init__(self, audio: bytes = b"audio") -> None:
+    def __init__(self, audio: bytes = b"audio", timestamps: list[dict] | None = None) -> None:
         self._audio = audio
+        self._timestamps = timestamps or [{}]
         self._messages: asyncio.Queue[Any] = asyncio.Queue()
         self.close_code: int | None = None
         self.sent: list[dict[str, Any]] = []
@@ -30,17 +32,16 @@ class _FakeWebSocket:
         packet = json.loads(data)
         self.sent.append(packet)
         if packet["type"] == "text.done":
-            await self._messages.put(
-                SimpleNamespace(
-                    type=aiohttp.WSMsgType.TEXT,
-                    data=json.dumps(
-                        {
-                            "type": "audio.delta",
-                            "delta": base64.b64encode(self._audio).decode("ascii"),
-                        }
-                    ),
+            for ts in self._timestamps:
+                frame = {
+                    "type": "audio.delta",
+                    "delta": base64.b64encode(self._audio).decode("ascii"),
+                }
+                if ts:
+                    frame["audio_timestamps"] = ts
+                await self._messages.put(
+                    SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps(frame))
                 )
-            )
             await self._messages.put(
                 SimpleNamespace(
                     type=aiohttp.WSMsgType.TEXT,
@@ -60,6 +61,7 @@ class _FakeEmitter:
         self.started_segments: list[str] = []
         self.ended_segments = 0
         self.audio_chunks: list[bytes] = []
+        self.timed: list[TimedString] = []
 
     def start_segment(self, *, segment_id: str) -> None:
         self.started_segments.append(segment_id)
@@ -69,6 +71,9 @@ class _FakeEmitter:
 
     def end_segment(self) -> None:
         self.ended_segments += 1
+
+    def push_timed_transcript(self, delta_text: TimedString | list[TimedString]) -> None:
+        self.timed += delta_text if isinstance(delta_text, list) else [delta_text]
 
 
 def _new_word_stream(tts: xai_tts.TTS, text: str):
@@ -118,3 +123,82 @@ async def test_streaming_segments_reuse_websocket_connection(monkeypatch: pytest
     await tts.aclose()
 
     assert websockets[0].closed is True
+
+
+def _graph(text: str, start: float, step: float = 0.1) -> dict[str, list]:
+    chars = list(text)
+    return {
+        "graph_chars": chars,
+        "graph_times": [[start + i * step, start + (i + 1) * step] for i in range(len(chars))],
+    }
+
+
+async def _run_with_timestamps(
+    monkeypatch: pytest.MonkeyPatch, tts: xai_tts.TTS, text: str, frames: list[dict]
+) -> tuple[_FakeWebSocket, _FakeEmitter]:
+    ws = _FakeWebSocket(timestamps=frames)
+
+    async def connect_ws(*_args: object, **_kwargs: object) -> _FakeWebSocket:
+        return ws
+
+    monkeypatch.setattr(tts, "_connect_ws", connect_ws)
+    emitter = _FakeEmitter()
+    stream = _new_synthesize_stream(tts)
+    await stream._run_ws(_new_word_stream(tts, text), emitter)  # pyright: ignore[reportPrivateUsage]
+    return ws, emitter
+
+
+@pytest.mark.asyncio
+async def test_char_timings_become_word_timed_transcripts(monkeypatch: pytest.MonkeyPatch):
+    tts = xai_tts.TTS(api_key="test-key")
+    # "Hi there " arrives in two frames, splitting "there" across them
+    frames = [_graph("Hi th", 0.0), _graph("ere ", 0.5)]
+    ws, emitter = await _run_with_timestamps(monkeypatch, tts, "Hi there", frames)
+
+    assert tts.capabilities.aligned_transcript
+    assert [p["delta"] for p in ws.sent if p["type"] == "text.delta"] == ["Hi ", "there "]
+    assert [(str(t), t.start_time, t.end_time) for t in emitter.timed] == [
+        ("Hi ", 0.0, pytest.approx(0.3)),
+        ("there ", pytest.approx(0.3), pytest.approx(0.9)),
+    ]
+    await tts.aclose()
+
+
+@pytest.mark.asyncio
+async def test_word_timestamps_off(monkeypatch: pytest.MonkeyPatch):
+    tts = xai_tts.TTS(api_key="test-key", word_timestamps=False)
+    _, emitter = await _run_with_timestamps(monkeypatch, tts, "Hi", [_graph("Hi ", 0.0)])
+
+    assert not tts.capabilities.aligned_transcript
+    assert emitter.timed == []
+    assert emitter.audio_chunks == [b"audio"]
+    await tts.aclose()
+
+
+@pytest.mark.asyncio
+async def test_malformed_timestamps_keep_audio(monkeypatch: pytest.MonkeyPatch):
+    tts = xai_tts.TTS(api_key="test-key")
+    bad = {"graph_chars": ["H", "i"], "graph_times": [[0.0, 0.1]]}
+    _, emitter = await _run_with_timestamps(monkeypatch, tts, "Hi", [bad])
+
+    assert emitter.timed == []
+    assert emitter.audio_chunks == [b"audio"]
+    await tts.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("word_timestamps", [True, False])
+async def test_with_timestamps_query_param(
+    word_timestamps: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tts = xai_tts.TTS(api_key="test-key", word_timestamps=word_timestamps)
+    urls: list[str] = []
+
+    class _FakeSession:
+        async def ws_connect(self, url: str, **_kwargs: object) -> _FakeWebSocket:
+            urls.append(url)
+            return _FakeWebSocket()
+
+    monkeypatch.setattr(tts, "_ensure_session", lambda: _FakeSession())
+    await tts._connect_ws(1.0, tts._opts)  # pyright: ignore[reportPrivateUsage]
+    assert ("with_timestamps=true" in urls[0]) is word_timestamps
